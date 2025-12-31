@@ -1,379 +1,257 @@
-
-# -*- coding: utf-8 -*-
-"""
-ve_core.py
-
-Height-based VE finite-volume solver (2D map) with:
-- Explicit FV with CFL substepping
-- Land trapping (simple hysteresis)
-- Optional 9-point diffusion (reduces grid-aligned artifacts)
-- Flux limiting (Van Leer) on face gradients (helps with checkerboard-ish oscillations)
-- Mass-conserving core update; any smoothing is display-only
-
-This is a pragmatic VE proxy meant for interactive screening, not a replacement
-for full 3D compositional simulation.
-"""
+# ve_core.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 
-
-DEFAULT_PARAMS = {
-    # grid
-    "dx_m": 25.0,
-    "dy_m": 25.0,
-
-    # physics-ish knobs (dimensionless / scaled)
-    "D0": 0.20,          # base diffusion-like spreading coefficient [m^2/day] (effective)
-    "mob_exp": 0.5,      # k scaling exponent in D = D0*(k/kref)^mob_exp
-    "anisD": 1.0,        # y-direction diffusivity multiplier
-
-    # saturation / trapping
-    "Sgr_max": 0.25,     # max trapped gas saturation
-    "Land_C": 1.0,       # Land hysteresis constant (higher -> less trapping)
-    "Sg_min": 0.0,
-    "Sg_max": 1.0,
-
-    # numerics
-    "cfl": 0.45,
-    "use_9pt": True,     # include diagonal diffusion
-    "use_limiter": True,
+DEFAULT_PARAMS: Dict[str, float] = {
+    "D0": 0.20,
+    "anisD": 1.0,
+    "mob_exp": 1.0,
+    "alpha_p": 1.0,
+    "ap_diff": 0.7,
+    "nu": 0.35,
+    "src_sigma": 2.0,
+    "prod_sigma": 3.0,
+    "prod_frac": 0.85,
+    "Swr": 0.15,
+    "Sgr_max": 0.35,
+    "C_L": 0.25,
+    "dt": 0.35,
+    "blur_steps": 1,
+    "clip_eps": 1e-6,
 }
 
-
 @dataclass
-class VEResult:
-    t_days: np.ndarray                 # (nt,)
-    q_m3_day: np.ndarray               # (nt,)
-    h_list: Optional[np.ndarray]       # (nt, nx, ny)
-    sg_list: Optional[np.ndarray]      # (nt, nx, ny)
-    p_list: Optional[np.ndarray]       # (nt, nx, ny)
-    plume_area_m2: np.ndarray          # (nt,)
-    eq_radius_m: np.ndarray            # (nt,)
-    mass_m3: np.ndarray                # (nt,)
-    meta: dict
+class ForwardResult:
+    t: np.ndarray
+    q: np.ndarray
+    sg_list: List[np.ndarray]
+    p_list: Optional[List[np.ndarray]]
+    area: np.ndarray
+    r_eq: np.ndarray
+    well_ij: Tuple[int, int]
 
+def prepare_phi_k(phi: np.ndarray, k: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    phi = np.asarray(phi, dtype=np.float32)
+    k = np.asarray(k, dtype=np.float32)
+    if phi.ndim != 2 or k.ndim != 2:
+        raise ValueError("phi and k must be 2D arrays.")
+    if phi.shape != k.shape:
+        raise ValueError(f"phi and k must have the same shape. Got {phi.shape} vs {k.shape}.")
 
-def _harmonic(a: np.ndarray, b: np.ndarray, eps: float = 1e-30) -> np.ndarray:
-    return 2.0 * a * b / (a + b + eps)
+    mask = np.isfinite(phi) & np.isfinite(k) & (phi > 0) & (k > 0)
+    if int(mask.sum()) < 10:
+        raise ValueError("Too few active cells after masking. Check phi/k inputs.")
 
+    phi_act = phi[mask]
+    k_act = k[mask]
 
-def _vanleer(r: np.ndarray) -> np.ndarray:
-    # Van Leer limiter
-    return (r + np.abs(r)) / (1.0 + np.abs(r) + 1e-30)
+    phi_norm = np.full_like(phi, np.nan, dtype=np.float32)
+    k_norm = np.full_like(k, np.nan, dtype=np.float32)
 
+    p5 = np.percentile(phi_act, 5)
+    p95 = np.percentile(phi_act, 95)
+    phi_norm[mask] = (phi_act - p5) / (p95 - p5 + 1e-12)
+    phi_norm[mask] = np.clip(phi_norm[mask], 0.0, 1.0)
 
-def _face_flux_limited(h: np.ndarray, D: np.ndarray, dx: float, axis: int) -> np.ndarray:
-    """
-    Compute limited diffusive flux on faces along given axis.
-    Returns flux array with same shape as h, representing net flux divergence contribution.
-    Conservative: uses face fluxes and accumulates divergence.
-    """
-    # For diffusion, limiter is heuristic; we limit face gradients based on neighboring gradients
-    # to suppress odd-even noise.
-    if axis == 0:  # x direction (i)
-        hm = h[:-1, :]
-        hp = h[1:, :]
-        grad = (hp - hm) / dx  # at faces
-        # r based on upwind-ish gradient ratio
-        grad_m = (hm - h[:-2, :]) / dx
-        grad_p = (h[2:, :] - hp) / dx
-        # Align shapes
-        r = np.ones_like(grad)
-        r[1:-1, :] = grad_m / (grad[1:-1, :] + 1e-30)
-        phi = _vanleer(r)
-        grad_limited = grad * phi
-        # D_face
-        Df = _harmonic(D[:-1, :], D[1:, :])
-        F = -Df * grad_limited  # flux across i+1/2 face (positive right)
-        div = np.zeros_like(h)
-        div[:-1, :] += F / dx
-        div[1:, :]  -= F / dx
-        return div
-    else:  # y direction (j)
-        hm = h[:, :-1]
-        hp = h[:, 1:]
-        grad = (hp - hm) / dx
-        grad_m = (hm - h[:, :-2]) / dx
-        grad_p = (h[:, 2:] - hp) / dx
-        r = np.ones_like(grad)
-        r[:, 1:-1] = grad_m / (grad[:, 1:-1] + 1e-30)
-        phi = _vanleer(r)
-        grad_limited = grad * phi
-        Df = _harmonic(D[:, :-1], D[:, 1:])
-        F = -Df * grad_limited
-        div = np.zeros_like(h)
-        div[:, :-1] += F / dx
-        div[:, 1:]  -= F / dx
-        return div
+    lk = np.log10(k_act)
+    p5 = np.percentile(lk, 5)
+    p95 = np.percentile(lk, 95)
+    lk_norm = (lk - p5) / (p95 - p5 + 1e-12)
+    lk_norm = np.clip(lk_norm, 0.0, 1.0)
+    k_norm[mask] = lk_norm.astype(np.float32)
 
+    return phi_norm, k_norm, mask
 
-def _face_flux_plain(h: np.ndarray, D: np.ndarray, dx: float, axis: int) -> np.ndarray:
-    if axis == 0:
-        grad = (h[1:, :] - h[:-1, :]) / dx
-        Df = _harmonic(D[:-1, :], D[1:, :])
-        F = -Df * grad
-        div = np.zeros_like(h)
-        div[:-1, :] += F / dx
-        div[1:, :]  -= F / dx
-        return div
-    else:
-        grad = (h[:, 1:] - h[:, :-1]) / dx
-        Df = _harmonic(D[:, :-1], D[:, 1:])
-        F = -Df * grad
-        div = np.zeros_like(h)
-        div[:, :-1] += F / dx
-        div[:, 1:]  -= F / dx
-        return div
+def choose_well_ij(k_norm: np.ndarray, mask: np.ndarray, mode: str, ij: Optional[Tuple[int, int]] = None) -> Tuple[int, int]:
+    nx, ny = k_norm.shape
+    if mode == "manual":
+        if ij is None:
+            raise ValueError("manual mode requires ij=(i,j)")
+        i, j = int(ij[0]), int(ij[1])
+        i = int(np.clip(i, 0, nx - 1))
+        j = int(np.clip(j, 0, ny - 1))
+        if not bool(mask[i, j]):
+            ii, jj = np.where(mask)
+            d = (ii - i) ** 2 + (jj - j) ** 2
+            k = int(np.argmin(d))
+            return int(ii[k]), int(jj[k])
+        return i, j
 
+    if mode == "center":
+        ii, jj = np.where(mask)
+        return int(np.median(ii)), int(np.median(jj))
 
-def _diag_diffusion_9pt(h: np.ndarray, D: np.ndarray, dx: float) -> np.ndarray:
-    """
-    Conservative diagonal diffusion using 4 diagonal neighbors.
-    Uses a reduced conductance to keep isotropy-ish.
-    """
-    # conductance for diagonals ~ 1/sqrt(2) distance -> factor
-    dd = dx * np.sqrt(2.0)
-    out = np.zeros_like(h)
+    if mode == "max_k":
+        tmp = np.where(mask, k_norm, -np.inf)
+        idx = np.unravel_index(int(np.argmax(tmp)), tmp.shape)
+        return int(idx[0]), int(idx[1])
 
-    # NE-SW
-    Dne = _harmonic(D[:-1, :-1], D[1:, 1:])
-    grad = (h[1:, 1:] - h[:-1, :-1]) / dd
-    F = -Dne * grad
-    out[:-1, :-1] += F / dd
-    out[1:, 1:]   -= F / dd
+    raise ValueError("well mode must be one of: max_k, center, manual")
 
-    # NW-SE
-    Dnw = _harmonic(D[1:, :-1], D[:-1, 1:])
-    grad = (h[:-1, 1:] - h[1:, :-1]) / dd
-    F = -Dnw * grad
-    out[1:, :-1] += F / dd
-    out[:-1, 1:] -= F / dd
+def _gauss2d(nx: int, ny: int, cx: int, cy: int, sigma: float) -> np.ndarray:
+    x = np.arange(nx)[:, None]
+    y = np.arange(ny)[None, :]
+    r2 = (x - cx) ** 2 + (y - cy) ** 2
+    g = np.exp(-0.5 * r2 / (sigma ** 2 + 1e-12)).astype(np.float32)
+    return g / (float(g.sum()) + 1e-12)
 
-    # Slightly reduce diagonal strength to avoid oversmoothing
-    return 0.5 * out
+def _grad2d(a: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    ax = np.empty_like(a, dtype=np.float32)
+    ay = np.empty_like(a, dtype=np.float32)
 
+    ax[1:-1, :] = 0.5 * (a[2:, :] - a[:-2, :])
+    ax[0, :] = a[1, :] - a[0, :]
+    ax[-1, :] = a[-1, :] - a[-2, :]
 
-def _safe_box_smooth_2d(x: np.ndarray, k: int = 3, weight: Optional[np.ndarray] = None) -> np.ndarray:
-    """
-    Box smoothing via integral image; safe for odd/even k.
-    Display-only helper (NOT used in solver).
-    """
-    if x is None:
-        return None
-    if k <= 1:
-        return x
-    k = int(k)
-    pad = k // 2
-    # pad with edge values
-    xp = np.pad(x, ((pad, pad), (pad, pad)), mode="edge").astype(np.float64)
-    if weight is None:
-        wp = np.ones_like(xp)
-    else:
-        wp = np.pad(weight, ((pad, pad), (pad, pad)), mode="edge").astype(np.float64)
+    ay[:, 1:-1] = 0.5 * (a[:, 2:] - a[:, :-2])
+    ay[:, 0] = a[:, 1] - a[:, 0]
+    ay[:, -1] = a[:, -1] - a[:, -2]
+    return ax, ay
 
-    # integral images
-    c = np.cumsum(np.cumsum(xp * wp, axis=0), axis=1)
-    w = np.cumsum(np.cumsum(wp, axis=0), axis=1)
+def _div2d(fx: np.ndarray, fy: np.ndarray) -> np.ndarray:
+    out = np.zeros_like(fx, dtype=np.float32)
+    out[1:, :] += fx[1:, :] - fx[:-1, :]
+    out[:, 1:] += fy[:, 1:] - fy[:, :-1]
+    return out
 
-    # summed area table window sum (vectorized)
-    # window corners: (i, j) to (i+k-1, j+k-1)
-    i0 = 0
-    j0 = 0
-    i1 = i0 + x.shape[0]
-    j1 = j0 + x.shape[1]
+def _blur2d(a: np.ndarray, mask: np.ndarray, steps: int = 1) -> np.ndarray:
+    if steps <= 0:
+        return a
+    kernel = np.array([1, 4, 6, 4, 1], dtype=np.float32)
+    kernel = kernel / kernel.sum()
 
-    A = c[i0:i1, j0:j1]
-    B = c[i0 + k:i1 + k, j0:j1]
-    C = c[i0:i1, j0 + k:j1 + k]
-    D = c[i0 + k:i1 + k, j0 + k:j1 + k]
-    num = D - B - C + A
+    out = a.copy().astype(np.float32)
+    for _ in range(steps):
+        tmp = out.copy()
+        for dx in range(-2, 3):
+            tmp += kernel[dx + 2] * np.roll(out, shift=dx, axis=0)
+        out = tmp / 2.0
 
-    Aw = w[i0:i1, j0:j1]
-    Bw = w[i0 + k:i1 + k, j0:j1]
-    Cw = w[i0:i1, j0 + k:j1 + k]
-    Dw = w[i0 + k:i1 + k, j0 + k:j1 + k]
-    den = Dw - Bw - Cw + Aw
+        tmp = out.copy()
+        for dy in range(-2, 3):
+            tmp += kernel[dy + 2] * np.roll(out, shift=dy, axis=1)
+        out = tmp / 2.0
 
-    return (num / np.maximum(den, 1e-30)).astype(x.dtype)
+        out = np.where(mask, out, 0.0).astype(np.float32)
+    return out
 
-
-def choose_well_ij(mask: np.ndarray) -> Tuple[int, int]:
-    """Choose a default well location: center of active cells."""
-    idx = np.argwhere(mask > 0)
-    if idx.size == 0:
-        return mask.shape[0] // 2, mask.shape[1] // 2
-    ci = int(np.round(np.mean(idx[:, 0])))
-    cj = int(np.round(np.mean(idx[:, 1])))
-    return ci, cj
-
-
-def run_ve_height_fv(
+def run_forward(
     phi: np.ndarray,
     k: np.ndarray,
-    H: np.ndarray,
-    mask: np.ndarray,
-    t_days: np.ndarray,
-    q_m3_day: np.ndarray,
-    well_ij: Tuple[int, int],
-    params: Optional[Dict] = None,
-    return_fields: bool = True,
-) -> VEResult:
-    """
-    Main forward simulator.
+    t: np.ndarray,
+    q: np.ndarray,
+    params: Dict[str, float],
+    well_mode: str = "max_k",
+    well_ij: Optional[Tuple[int, int]] = None,
+    return_pressure: bool = True,
+    thr_area: float = 0.05,
+) -> ForwardResult:
+    params = {**DEFAULT_PARAMS, **(params or {})}
 
-    Inputs
-    - phi, k, H: (nx, ny) float arrays
-    - mask: (nx, ny) bool/uint8 active map
-    - t_days: (nt,) days (monotone)
-    - q_m3_day: (nt,) piecewise-constant on same grid
-    - well_ij: injector/producer cell (i,j)
-    - params: dict (overrides DEFAULT_PARAMS)
-    """
-    p = dict(DEFAULT_PARAMS)
-    if params:
-        p.update(params)
-
+    phi_norm, k_norm, mask = prepare_phi_k(phi, k)
     nx, ny = phi.shape
-    dx = float(p["dx_m"])
-    dy = float(p["dy_m"])
+    wi, wj = choose_well_ij(k_norm, mask, well_mode, ij=well_ij)
 
-    phi = phi.astype(np.float64)
-    k = k.astype(np.float64)
-    H = H.astype(np.float64)
-    m = mask.astype(bool)
+    t = np.asarray(t, dtype=np.float32).reshape(-1)
+    q = np.asarray(q, dtype=np.float32).reshape(-1)
+    if t.size != q.size:
+        raise ValueError("t and q must have the same length.")
+    Nt = int(t.size)
+    if Nt < 2:
+        raise ValueError("Need at least 2 timesteps.")
 
-    # Normalize k for diffusion scaling
-    kref = np.nanmedian(k[m]) if np.any(m) else 1.0
-    kref = max(float(kref), 1e-12)
-    D = float(p["D0"]) * np.power(np.maximum(k / kref, 1e-12), float(p["mob_exp"]))
-    Dy = float(p["anisD"]) * D
+    src = _gauss2d(nx, ny, wi, wj, float(params["src_sigma"]))
+    prod = _gauss2d(nx, ny, wi, wj, float(params["prod_sigma"]))
 
-    # State: gas thickness h (m) and hysteresis tracking
-    h = np.zeros((nx, ny), dtype=np.float64)
-    sg_max_hist = np.zeros_like(h)
-    sgr = np.zeros_like(h)
+    dom = float(max(nx, ny))
+    p_sigma = float(params["ap_diff"]) * 0.12 * dom + 1e-6
 
-    # Storage
-    nt = int(len(t_days))
-    if return_fields:
-        h_out = np.zeros((nt, nx, ny), dtype=np.float32)
-        sg_out = np.zeros((nt, nx, ny), dtype=np.float32)
-        p_out = np.zeros((nt, nx, ny), dtype=np.float32)
-    else:
-        h_out = sg_out = p_out = None
+    sg = np.zeros((nx, ny), dtype=np.float32)
+    sg_max = np.zeros((nx, ny), dtype=np.float32)
+    sg_list: List[np.ndarray] = []
+    p_list: List[np.ndarray] = []
 
-    area = dx * dy
-    plume_area = np.zeros(nt, dtype=np.float64)
-    eq_r = np.zeros(nt, dtype=np.float64)
-    mass = np.zeros(nt, dtype=np.float64)
+    area = np.zeros((Nt,), dtype=np.float32)
+    r_eq = np.zeros((Nt,), dtype=np.float32)
 
-    wi, wj = int(well_ij[0]), int(well_ij[1])
-    wi = max(0, min(nx - 1, wi))
-    wj = max(0, min(ny - 1, wj))
+    dt = float(params["dt"])
+    D0 = float(params["D0"])
+    nu = float(params["nu"])
+    mob_exp = float(params["mob_exp"])
+    anisD = float(params["anisD"])
+    Swr = float(params["Swr"])
+    Sgr_max = float(params["Sgr_max"])
+    C_L = float(params["C_L"])
+    prod_frac = float(params["prod_frac"])
+    blur_steps = int(params["blur_steps"])
 
-    # Helper: pressure surrogate for visualization
-    def pressure_field(qval):
-        # simple smooth kernel around well, scaled by q
-        rr2 = (np.arange(nx)[:, None] - wi) ** 2 + (np.arange(ny)[None, :] - wj) ** 2
-        sig2 = (0.08 * max(nx, ny)) ** 2
-        amp = float(qval) / max(area, 1e-9)
-        return amp * np.exp(-rr2 / (2.0 * sig2))
+    mob = np.where(mask, (k_norm ** mob_exp), 0.0).astype(np.float32)
 
-    # time stepping
-    for it in range(nt):
-        t0 = float(t_days[it])
-        t1 = float(t_days[it + 1]) if it < nt - 1 else t0 + 1.0
-        dt_big = max(t1 - t0, 1e-9)
-        qval = float(q_m3_day[it])
+    for n in range(Nt):
+        qq = float(q[n])
 
-        # CFL substepping based on max diffusivity
-        Dmax = float(np.nanmax(D[m])) if np.any(m) else 1.0
-        Dmaxy = float(np.nanmax(Dy[m])) if np.any(m) else 1.0
-        dt_cfl = float(p["cfl"]) * min(dx * dx / (4.0 * max(Dmax, 1e-12)),
-                                       dy * dy / (4.0 * max(Dmaxy, 1e-12)))
-        nsub = int(np.ceil(dt_big / max(dt_cfl, 1e-9)))
-        dt = dt_big / nsub
+        p = (float(params["alpha_p"]) * qq) * _gauss2d(nx, ny, wi, wj, p_sigma)
+        p = np.where(mask, p, 0.0).astype(np.float32)
 
-        for _ in range(nsub):
-            # Source term -> thickness change at well
-            if m[wi, wj]:
-                dh_src = (qval * dt) / max(phi[wi, wj] * area, 1e-12)  # m of gas volume per pore area
-            else:
-                dh_src = 0.0
+        px, py = _grad2d(p)
+        vx = -mob * px
+        vy = -mob * py
 
-            # Diffusion update (conservative FV)
-            if bool(p["use_limiter"]):
-                divx = _face_flux_limited(h, D, dx, axis=0)
-                divy = _face_flux_limited(h, Dy, dy, axis=1)
-            else:
-                divx = _face_flux_plain(h, D, dx, axis=0)
-                divy = _face_flux_plain(h, Dy, dy, axis=1)
+        sx, sy = _grad2d(sg)
+        Dx = D0 * mob * anisD
+        Dy = D0 * mob / max(anisD, 1e-6)
+        fx = -Dx * sx
+        fy = -Dy * sy
+        diff_term = _div2d(fx, fy)
 
-            div = divx + divy
+        adv_fx = vx * sg
+        adv_fy = vy * sg
+        adv_term = -_div2d(adv_fx, adv_fy)
 
-            if bool(p["use_9pt"]):
-                div += _diag_diffusion_9pt(h, 0.5 * (D + Dy), min(dx, dy))
+        if qq >= 0:
+            source = qq * src
+            sink = 0.0
+        else:
+            source = 0.0
+            sink = (-qq) * prod
 
-            h_new = h + dt * div
-            # Apply source at well
-            h_new[wi, wj] += dh_src
+        sg_max = np.maximum(sg_max, sg)
+        sgr = np.minimum(Sgr_max, C_L * sg_max)
+        mobile = np.maximum(0.0, sg - sgr)
 
-            # Enforce boundaries / mask: no-flow outside active
-            h_new[~m] = 0.0
+        if qq < 0:
+            mobile = np.maximum(0.0, mobile - prod_frac * sink)
 
-            # Convert to saturation
-            sg = np.clip(h_new / np.maximum(H, 1e-9), float(p["Sg_min"]), float(p["Sg_max"]))
+        mobile_new = mobile + dt * (diff_term + nu * adv_term) + dt * source
+        mobile_new = np.clip(mobile_new, 0.0, 1.0).astype(np.float32)
 
-            # Hysteresis / Land trapping (simple)
-            sg_max_hist = np.maximum(sg_max_hist, sg)
-            # Land-style trapped saturation target
-            # Sgr = Sgr_max * Sg_max / (Sg_max + C*(1-Sg_max))
-            C = float(p["Land_C"])
-            Sgr_max = float(p["Sgr_max"])
-            sgr_target = Sgr_max * sg_max_hist / np.maximum(sg_max_hist + C * (1.0 - sg_max_hist), 1e-9)
-            # During withdrawal, prevent sg from dropping below sgr_target
-            if qval < 0:
-                sg = np.maximum(sg, sgr_target)
-                h_new = sg * H
-            sgr = sgr_target
+        sg = mobile_new + sgr
+        sg = np.clip(sg, 0.0, 1.0 - Swr).astype(np.float32)
 
-            # Commit
-            h = np.clip(h_new, 0.0, np.nanmax(H[m]) if np.any(m) else np.inf)
+        sg = _blur2d(sg, mask, steps=blur_steps)
+        sg = np.where(mask, sg, 0.0).astype(np.float32)
+        sg = np.nan_to_num(sg, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        sg[sg < float(params["clip_eps"])] = 0.0
 
-        # Diagnostics
-        sg = np.clip(h / np.maximum(H, 1e-9), 0.0, 1.0)
-        mobile = np.maximum(sg - sgr, 0.0)
-        # Gas volume (mobile + trapped) in reservoir units (m^3) per cell: phi*area*h
-        mass[it] = float(np.nansum(phi[m] * area * h[m]))
-        plume_area[it] = float(np.sum((sg[m] > 0.02).astype(np.float64)) * area)
-        eq_r[it] = float(np.sqrt(plume_area[it] / np.pi)) if plume_area[it] > 0 else 0.0
+        sg_list.append(sg.copy())
+        if return_pressure:
+            p_list.append(p.copy())
 
-        if return_fields:
-            h_out[it] = h.astype(np.float32)
-            sg_out[it] = sg.astype(np.float32)
-            p_out[it] = pressure_field(qval).astype(np.float32)
+        plume = (sg > float(thr_area)) & mask
+        a = float(plume.sum())
+        area[n] = a
+        r_eq[n] = float(np.sqrt(a / np.pi)) if a > 0 else 0.0
 
-    meta = {
-        "params": p,
-        "well_ij": (wi, wj),
-        "dx_m": dx,
-        "dy_m": dy,
-    }
-    return VEResult(
-        t_days=t_days.astype(np.float32),
-        q_m3_day=q_m3_day.astype(np.float32),
-        h_list=h_out,
-        sg_list=sg_out,
-        p_list=p_out,
-        plume_area_m2=plume_area.astype(np.float32),
-        eq_radius_m=eq_r.astype(np.float32),
-        mass_m3=mass.astype(np.float32),
-        meta=meta,
+    return ForwardResult(
+        t=t,
+        q=q,
+        sg_list=sg_list,
+        p_list=p_list if return_pressure else None,
+        area=area,
+        r_eq=r_eq,
+        well_ij=(wi, wj),
     )
-
-
-# Export display-only smoother so app can call it safely
-box_smooth_2d = _safe_box_smooth_2d
